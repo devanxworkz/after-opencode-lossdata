@@ -1,6 +1,6 @@
 ﻿import React, { useEffect, useRef, useState } from "react";
 import { LineChart, Line, Area, YAxis, ResponsiveContainer } from "recharts";
-import { Bike, Gauge, Route } from "lucide-react";
+import { Bike, Gauge, Route, WifiOff } from "lucide-react";
 
 const BikekIcon = ({ className = "w-[26px] h-[26px]" }) => (
   <svg
@@ -33,7 +33,7 @@ const CheckIcon = ({ className = "w-[26px] h-[26px]" }) => (
   </svg>
 );
 
-const WarningIcon = ({ className = "w-[26px] h-[26px]" }) => (
+const FactoryIcon = ({ className = "w-[26px] h-[26px]" }) => (
   <svg
     viewBox="0 0 24 24"
     fill="none"
@@ -43,25 +43,10 @@ const WarningIcon = ({ className = "w-[26px] h-[26px]" }) => (
     strokeLinejoin="round"
     className={className}
   >
-    <path d="M10.3 3.9L1.8 18a2 2 0 0 0 1.7 3h16.9a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0z" />
-    <path d="M12 9v4" />
-    <path d="M12 17h.01" />
-  </svg>
-);
-
-const CriticalIcon = ({ className = "w-[26px] h-[26px]" }) => (
-  <svg
-    viewBox="0 0 24 24"
-    fill="none"
-    stroke="currentColor"
-    strokeWidth="1.8"
-    strokeLinecap="round"
-    strokeLinejoin="round"
-    className={className}
-  >
-    <path d="M12 8.5L2.5 16.5a2 2 0 0 0 1.2 3.5h16.6a2 2 0 0 0 1.2-3.5L12 8.5z" />
-    <path d="M12 12v3" />
-    <path d="M12 18h.01" />
+    <path d="M2 20a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2V8l-7 5V8l-7 5V4a2 2 0 0 0-2-2H4a2 2 0 0 0-2 2Z" />
+    <path d="M17 18h1" />
+    <path d="M12 18h1" />
+    <path d="M7 18h1" />
   </svg>
 );
 
@@ -334,6 +319,70 @@ const extractOwnerName = (raw) => {
   return null;
 };
 
+// Display rule: a VIN must be exactly 17 characters (string, non-empty,
+// no whitespace normalization) to count or be listed anywhere in Nxdetails.
+export const isValidVin = (vin) => typeof vin === "string" && vin.length === 17;
+
+// On Road / In Plant classification. A vehicle is "On Road" only when the
+// live `plate_num` is a non-whitespace string; anything missing/empty means
+// "In Plant".
+export const hasPlateNumber = (plateNum) =>
+  typeof plateNum === "string" && plateNum.trim().length > 0;
+
+export const isVinInRange = (vin) => {
+  const start = "ME9NP1411H2172001";
+  const end = "ME9NP1411H2172151";
+  return vin >= start && vin <= end;
+};
+
+export const getReportedTimeMs = (time) => {
+  if (time === null || time === undefined || time === "") return null;
+  if (typeof time === "number") {
+    if (!Number.isFinite(time)) return null;
+    return time < 1e12 ? time * 1000 : time;
+  }
+  const raw = String(time).trim();
+  if (!raw) return null;
+  if (/^\d+$/.test(raw)) {
+    const n = Number(raw);
+    return raw.length <= 10 ? n * 1000 : n;
+  }
+  // The telemetry server records timestamps in UTC (e.g. "2026-11-23 07:09:37" or with 'T'/'Z').
+  // If no timezone suffix exists, append 'Z' so browser doesn't parse it as local time (e.g. IST +5:30),
+  // which would cause a 5.5 hour discrepancy and falsely flag online vehicles as offline.
+  let utcStr = raw;
+  if (!/Z$/i.test(utcStr) && !/[+-]\d{2}:?\d{2}$/.test(utcStr)) {
+    utcStr = utcStr.replace(" ", "T") + "Z";
+  }
+  const parsedUtc = Date.parse(utcStr);
+  if (Number.isFinite(parsedUtc)) return parsedUtc;
+  const parsed = Date.parse(raw);
+  return Number.isFinite(parsed) ? parsed : null;
+};
+
+export const checkIsOffline = (vehicle, now = Date.now()) => {
+  if (!vehicle) return false;
+  const vin = String(vehicle.vinnumber || vehicle.vin || "").trim();
+  // Demo VINs are never offline.
+  if (isVinInRange(vin)) return false;
+  // Only real vehicles with a plate number can be shown as offline.
+  const plate = vehicle.plate_num || vehicle.plate || vehicle.platenumber;
+  if (!hasPlateNumber(plate)) return false;
+  const reportedAt = getReportedTimeMs(vehicle.time);
+  // No usable last-report time: treat as offline until it reports again.
+  if (reportedAt === null) return true;
+  return now - reportedAt > 5 * 60 * 1000;
+};
+
+// This page unmounts when the user switches to another nav tab. Remember the
+// selected view here so coming back restores the same chip/card (for example
+// On Road or Critical) instead of resetting to All / Total vehicles.
+const pageFilterCache = {
+  statusFilter: "all",
+  sortOption: "",
+  activeCard: "total",
+};
+
 const Nxdetails = ({ onVehicleSelect }) => {
   const [vehicles, setVehicles] = useState([]);
   const [loading, setLoading] = useState(true);
@@ -342,8 +391,28 @@ const Nxdetails = ({ onVehicleSelect }) => {
   const [selectedVehicle, setSelectedVehicle] = useState(null);
   const [highlightedIndex, setHighlightedIndex] = useState(0);
   const [showSuggestions, setShowSuggestions] = useState(false);
-  const [statusFilter, setStatusFilter] = useState("all");
-  const [sortOption, setSortOption] = useState("");
+  const [statusFilter, setStatusFilter] = useState(pageFilterCache.statusFilter);
+  const [sortOption, setSortOption] = useState(pageFilterCache.sortOption);
+  // The summary card the user last selected. Drives the active highlight and,
+  // for Total/Odometer, the reset-to-all behavior.
+  const [activeCard, setActiveCard] = useState(pageFilterCache.activeCard);
+
+  // Clock for the 5-minute offline check. Ticks independently of the WS feed
+  // so a vehicle turns offline even if the socket stops sending messages.
+  const [nowTick, setNowTick] = useState(() => Date.now());
+
+  // Keep the cache in sync with whatever the user selects right now, so it is
+  // already up to date when this tab unmounts.
+  useEffect(() => {
+    pageFilterCache.statusFilter = statusFilter;
+    pageFilterCache.sortOption = sortOption;
+    pageFilterCache.activeCard = activeCard;
+  }, [statusFilter, sortOption, activeCard]);
+
+  useEffect(() => {
+    const id = setInterval(() => setNowTick(Date.now()), 10000);
+    return () => clearInterval(id);
+  }, []);
 
   const [usageHistory, setUsageHistory] = useState({});
   const usageHistoryFetched = useRef({});
@@ -477,7 +546,7 @@ const Nxdetails = ({ onVehicleSelect }) => {
         return;
       }
 
-      ws = new WebSocket("wss://cc.rivotmotors.com/live/all");
+    ws = new WebSocket("wss://cc.rivotmotors.com/live/all");
 
       ws.onopen = () => {
         if (disposed) {
@@ -506,16 +575,19 @@ const Nxdetails = ({ onVehicleSelect }) => {
 
               return {
                 vinnumber: vin,
+                plate_num: item.plate_num,
                 ownername:
                   item.owner_name ||
                   extractOwnerName(item.data) ||
                   extractOwnerName(item.owner),
                 soc: item.soc,
                 batvoltage: item.bat_voltage,
+                speed_kmph: item.speed_kmph,
                 odo: item.odometer,
                 uptime: item.uptime,
                 recoengine: item.reco_engine,
                 lat_long: item.lat_long,
+                day_km: item.day_km,
                 time: item.time,
               };
             })
@@ -555,11 +627,21 @@ const Nxdetails = ({ onVehicleSelect }) => {
               String(v.vinnumber) === vin
                 ? {
                     ...v,
+                    plate_num:
+                      data.plate_num !== undefined
+                        ? data.plate_num
+                        : message.plate_num !== undefined
+                        ? message.plate_num
+                        : v.plate_num,
                     soc: data.soc !== undefined ? data.soc : v.soc,
                     batvoltage:
                       data.bat_voltage !== undefined
                         ? data.bat_voltage
                         : v.batvoltage,
+                    speed_kmph:
+                      data.speed_kmph !== undefined
+                        ? data.speed_kmph
+                        : v.speed_kmph,
                     odo: data.odometer !== undefined ? data.odometer : v.odo,
                     uptime: data.uptime !== undefined ? data.uptime : v.uptime,
                     recoengine:
@@ -568,6 +650,8 @@ const Nxdetails = ({ onVehicleSelect }) => {
                         : v.recoengine,
                     lat_long:
                       data.lat_long !== undefined ? data.lat_long : v.lat_long,
+                    day_km:
+                      data.day_km !== undefined ? data.day_km : v.day_km,
                     time: data.time !== undefined ? data.time : v.time,
                     ownername:
                       data.owner_name ||
@@ -658,6 +742,23 @@ const Nxdetails = ({ onVehicleSelect }) => {
     return result;
   };
 
+  // day_km may arrive as plain semicolon-separated values: "20.0;18.7"
+  // First value = today km, second value = last day km.
+  const parseSemicolonKm = (data) => {
+    const result = { today: null, lastDay: null };
+
+    if (data === null || data === undefined) return result;
+
+    const parts = String(data)
+      .split(";")
+      .map((p) => parseFloat(p.trim()));
+
+    if (parts.length > 0 && !isNaN(parts[0])) result.today = parts[0];
+    if (parts.length > 1 && !isNaN(parts[1])) result.lastDay = parts[1];
+
+    return result;
+  };
+
   // -------------------------------------------------------------------------
   // Helper: format a distance value, missing data shows "-", zero shows 0.0 km
   // -------------------------------------------------------------------------
@@ -678,11 +779,15 @@ const Nxdetails = ({ onVehicleSelect }) => {
 
   
   const getVoltageStatus = (voltage) => {
+    // A vehicle only reaches this table with a valid VIN. If its battery
+    // voltage is missing / blank / not yet reported, it is still an online
+    // vehicle, so count it as Normal instead of hiding it in an "offline"
+    // bucket (which would make Normal 171 while Total shows 172).
     if (voltage === null || voltage === undefined || voltage === "") {
-      return "none";
+      return "normal";
     }
     const v = Number(voltage);
-    if (isNaN(v)) return "none";
+    if (isNaN(v)) return "normal";
     if (v < 70) return "critical";
     if (v < 72) return "warning";
     return "normal";
@@ -697,8 +802,45 @@ const Nxdetails = ({ onVehicleSelect }) => {
       case "normal":
         return "#22C55E";
       default:
-        return "#9CA3AF";
+        return "#22C55E";
     }
+  };
+
+  // Live speed (km/h) pushed by the WS feed. Only a positive, numeric value
+  // means the vehicle is riding; null / "" / missing / 0 all mean idle.
+  const getSpeedValue = (value) => {
+    if (value === null || value === undefined || value === "") return null;
+    const n = Number(value);
+    if (!Number.isFinite(n) || n <= 0) return null;
+    return n;
+  };
+
+  const formatSpeedValue = (value) =>
+    Number.isInteger(value) ? String(value) : value.toFixed(1);
+
+  // Small orange gauge badge shown in the Owner/VIN column while riding.
+  const renderSpeedBadge = (speed, className = "") => {
+    if (speed === null) return null;
+    return (
+      <span
+        className={`inline-flex items-center gap-1 rounded-[6px] px-1.5 py-[2px] font-Kanit font-semibold text-[#FF9500] pointer-events-none ${className}`}
+        style={{
+          background: "rgba(255,149,0,0.10)",
+          border: "1px solid rgba(255,149,0,0.45)",
+          boxShadow: "0 0 10px rgba(255,149,0,0.15)",
+        }}
+        title={`Riding at ${formatSpeedValue(speed)} km/h`}
+      >
+        <Gauge className="w-3 h-3 shrink-0" />
+        <span className="leading-none">{formatSpeedValue(speed)}</span>
+        <span
+          className="text-[8px] font-medium leading-none"
+          style={{ color: "rgba(255,149,0,0.75)" }}
+        >
+          km/h
+        </span>
+      </span>
+    );
   };
 
   // -------------------------------------------------------------------------
@@ -753,10 +895,16 @@ const Nxdetails = ({ onVehicleSelect }) => {
     if (!value) return "-";
     const str = String(value).trim();
     if (!str) return "-";
-    const parts = str.split(",").map((p) => p.trim());
-    const third = parts[2];
-    if (!third) return "-";
-    return `${third} km`;
+    const parts = str.split(/[,; ]/).map((p) => p.trim()).filter(Boolean);
+    let regenStr = null;
+    if (parts.length >= 3) regenStr = parts[2];
+    else if (parts.length === 1) regenStr = parts[0];
+    else return "-";
+    const num = Number(regenStr);
+    if (Number.isFinite(num)) {
+      return `${num.toFixed(2)} km`;
+    }
+    return `${regenStr} km`;
   };
 
   const getVoltageNumber = (v) => {
@@ -820,8 +968,18 @@ const Nxdetails = ({ onVehicleSelect }) => {
   const buildVehicleView = (vehicle) => {
     const todayRaw = vehicle.today_km;
     const lastDayRaw = vehicle.last_day_km;
-    const today = todayRaw === null || todayRaw === undefined ? null : Number(todayRaw);
-    const lastDay = lastDayRaw === null || lastDayRaw === undefined ? null : Number(lastDayRaw);
+    const dk = vehicle.day_km;
+    let today = todayRaw === null || todayRaw === undefined ? null : Number(todayRaw);
+    let lastDay = lastDayRaw === null || lastDayRaw === undefined ? null : Number(lastDayRaw);
+    if ((today === null || Number.isNaN(today) || lastDay === null || Number.isNaN(lastDay)) && dk) {
+      // day_km can come as plain "20.0;18.7" (today;lastDay) or as
+      // key=value pairs ("daykm=..;lastdaykm=..").
+      const d = String(dk).includes("=")
+        ? parseDistanceData(dk)
+        : parseSemicolonKm(dk);
+      if (today === null || Number.isNaN(today)) today = d.today;
+      if (lastDay === null || Number.isNaN(lastDay)) lastDay = d.lastDay;
+    }
     const status = getVoltageStatus(vehicle.batvoltage);
     const voltageColor = getVoltageColor(vehicle.batvoltage);
     const socNumber = Number(vehicle.soc);
@@ -860,11 +1018,15 @@ const Nxdetails = ({ onVehicleSelect }) => {
 
   const locatorSearch = searchTerm.trim().toLowerCase();
 
-  // Total Odometer: summed over the FULL fetched vehicle list (already
-  // restricted to exactly-17-character VINs in the API handler), so the
-  // current search/status filter never affects it. Length check kept for safety.
+  // Single derived source for every list and count below. Live WebSocket
+  // updates still mutate the raw `vehicles` state; this re-derives on each
+  // render so invalid (non-17-char) VINs never reach totals or the table.
+  const validVehicles = vehicles.filter((v) => isValidVin(v?.vinnumber));
+
+  // Total Odometer: summed over the FILTERED vehicle list so invalid VINs
+  // cannot inflate it. The current search/status filter never affects it.
   // -----------------------------------------------------------------------
-  const totalOdometer = vehicles.reduce((sum, vehicle) => {
+  const totalOdometer = validVehicles.reduce((sum, vehicle) => {
     const odoRaw = vehicle.odo;
 
     if (odoRaw === null || odoRaw === undefined) return sum;
@@ -881,9 +1043,18 @@ const Nxdetails = ({ onVehicleSelect }) => {
     maximumFractionDigits: 1,
   })} km`;
 
-  // Status counts for the Normal / Warning / Critical / Offline cards
+  // Offline = a real plated vehicle whose last report is older than 5 minutes.
+  // The demo VIN range and vehicles without a plate are never offline.
   // -----------------------------------------------------------------------
-  const statusCounts = vehicles.reduce(
+  const isOffline = (vehicle) => checkIsOffline(vehicle, nowTick);
+
+  const offlineCount = validVehicles.filter((v) => isOffline(v)).length;
+
+  // Voltage status counts for the Normal / Warning / Critical chips.
+  // Offline is tracked separately above because it is time-based and can
+  // overlap the voltage states.
+  // -----------------------------------------------------------------------
+  const statusCounts = validVehicles.reduce(
     (acc, v) => {
       const s = getVoltageStatus(v.batvoltage);
       acc.total += 1;
@@ -896,15 +1067,38 @@ const Nxdetails = ({ onVehicleSelect }) => {
     { total: 0, normal: 0, warning: 0, critical: 0, offline: 0 }
   );
 
+  // Riding count: vehicles currently moving, taken from the live WS speed.
+  // Same valid-VIN dataset as every other card, so it always stays in sync
+  // with the feed without touching the backend.
+  // Vehicles that are offline (no report for >5min) are excluded from the count.
+  const ridingCount = validVehicles.filter(
+    (v) => getSpeedValue(v.speed_kmph) !== null && !isOffline(v)
+  ).length;
+
+  // On Road / In Plant counts over the same valid-VIN dataset, so
+  // On Road + In Plant always equals Total valid vehicles.
+  const onRoadCount = validVehicles.filter((v) =>
+    hasPlateNumber(v.plate_num)
+  ).length;
+  const inPlantCount = validVehicles.length - onRoadCount;
+
   // Flow: API -> VIN filtering -> knownOrder/extra ordering -> status filter
   //       -> search filter -> sort -> display
   // -----------------------------------------------------------------------
   const statusFilteredVehicles =
     statusFilter === "all"
-      ? vehicles
-      : vehicles.filter(
-          (v) => getVoltageStatus(v.batvoltage) === statusFilter
-        );
+      ? validVehicles
+      : statusFilter === "riding"
+        ? validVehicles.filter(
+            (v) => getSpeedValue(v.speed_kmph) !== null && !isOffline(v)
+          )
+        : statusFilter === "offline"
+        ? validVehicles.filter(
+            (v) => isOffline(v)
+          )
+        : validVehicles.filter(
+            (v) => getVoltageStatus(v.batvoltage) === statusFilter
+          );
 
   const selectedVIN = selectedVehicle
     ? String(selectedVehicle.vinnumber)
@@ -912,6 +1106,12 @@ const Nxdetails = ({ onVehicleSelect }) => {
 
   const displayedVehicles = sortVehicles(
     statusFilteredVehicles.filter((vehicle) => {
+      // On Road / In Plant act as filters (not sort keys): selected from the
+      // same dropdown, they restrict the list by plate_num presence.
+      if (sortOption === "onroad") return hasPlateNumber(vehicle.plate_num);
+      if (sortOption === "inplant") return !hasPlateNumber(vehicle.plate_num);
+      return true;
+    }).filter((vehicle) => {
       // When a suggestion has been selected, show exactly that vehicle.
       if (selectedVIN) {
         return String(vehicle.vinnumber) === selectedVIN;
@@ -987,13 +1187,37 @@ const Nxdetails = ({ onVehicleSelect }) => {
     // });
   }, [displayedVehicles, loading]);
 
+  // Lightweight fade/slide of the vehicle list whenever the visible result set
+  // changes (card filter, search, sort). Uses the Web Animations API so no new
+  // dependency or global keyframes are needed; respects reduced-motion.
+  const listAnimRef = useRef(null);
+
+  useEffect(() => {
+    const el = listAnimRef.current;
+    if (!el || typeof el.animate !== "function") return;
+    if (
+      typeof window !== "undefined" &&
+      window.matchMedia &&
+      window.matchMedia("(prefers-reduced-motion: reduce)").matches
+    ) {
+      return;
+    }
+    el.animate(
+      [
+        { opacity: 0, transform: "translateY(4px)" },
+        { opacity: 1, transform: "translateY(0)" },
+      ],
+      { duration: 220, easing: "ease-out" }
+    );
+  }, [statusFilter, sortOption, locatorSearch, selectedVIN, loading]);
+
   // Autocomplete suggestions (only once the user types >= 2 characters)
   // -----------------------------------------------------------------------
   const query = searchInput.trim().toLowerCase();
 
   const suggestionList =
     query.length >= 2
-      ? vehicles
+      ? validVehicles
           .filter(
             (v) =>
               String(v.vinnumber || "").toLowerCase().includes(query) ||
@@ -1028,19 +1252,49 @@ const Nxdetails = ({ onVehicleSelect }) => {
   const roundPct = (value) => pcntOfTotal(value).replace(/\.0%$/, "%");
 
   const filterOptions = [
-    { key: "all", label: "All", color: null, count: vehicles.length },
+    { key: "all", label: "All", color: null, count: validVehicles.length },
     { key: "normal", label: "Normal", color: "#22C55E", count: statusCounts.normal },
     { key: "warning", label: "Warning", color: "#FF9500", count: statusCounts.warning },
     { key: "critical", label: "Critical", color: "#EF4444", count: statusCounts.critical },
-    // { key: "none", label: "Offline", color: "#6B7280", count: statusCounts.offline },
+// Offline filter option handled separately; keep offline chip if needed
+    { key: "riding", label: "Riding", color: "#0EA5E9", count: ridingCount },
   ];
+
+  // The selected summary card is a single active "category" control. On Road /
+  // In Plant reuse the existing plate filter (sortOption) and Critical reuses
+  // statusFilter, so the chips and sort dropdown stay in sync with the cards.
+  const clearPlateFilter = () => {
+    if (sortOption === "onroad" || sortOption === "inplant") setSortOption("");
+  };
+
+  const isCardActive = (card) => activeCard === card.key;
+
+  const selectSummaryCard = (card) => {
+    setActiveCard(card.key);
+    if (card.key === "onroad") {
+      setStatusFilter("all");
+      setSortOption("onroad");
+    } else if (card.key === "inplant") {
+      setStatusFilter("all");
+      setSortOption("inplant");
+    } else if (card.key === "offline") {
+      clearPlateFilter();
+      setStatusFilter("offline");
+    } else if (card.key === "critical") {
+      clearPlateFilter();
+      setStatusFilter("critical");
+    } else {
+      clearPlateFilter();
+      setStatusFilter("all");
+    }
+  };
 
   const summaryCards = [
     {
       key: "total",
       status: null,
       label: "Total vehicles",
-      value: vehicles.length,
+      value: validVehicles.length,
       // secondary: "All vehicles",
       secondaryColor: "#929292",
       icon: <Bike className="w-[clamp(18px,5vw,22px)] h-[clamp(18px,5vw,22px)] md:w-6 md:h-6" />,
@@ -1059,69 +1313,89 @@ const Nxdetails = ({ onVehicleSelect }) => {
       valueClass: "text-white",
     },
     {
-      key: "normal",
-      status: "normal",
-      label: "Normal",
-      value: statusCounts.normal,
-      // secondary: roundPct(statusCounts.normal),
-      // secondaryColor: "#22C55E",
+      key: "onroad",
+      filterType: "plate",
+      filterValue: "onroad",
+      label: "On Road",
+      value: onRoadCount,
+      secondaryColor: "#22C55E",
       icon: <CheckIcon className="w-[clamp(22px,6.5vw,32px)] h-[clamp(22px,6.5vw,32px)] md:w-[26px] md:h-[26px]" />,
       accent: "#22C55E",
       valueClass: "text-[#22C55E]",
     },
     {
-      key: "warning",
-      status: "warning",
-      label: "Warning",
-      value: statusCounts.warning,
-      // secondary: roundPct(statusCounts.warning),
-      secondaryColor: "#FF9500",
-      icon: <WarningIcon className="w-[clamp(22px,6.5vw,32px)] h-[clamp(22px,6.5vw,32px)] md:w-[26px] md:h-[26px]" />,
-      accent: "#FF9500",
-      valueClass: "text-[#FF9500]",
+      key: "inplant",
+      filterType: "plate",
+      filterValue: "inplant",
+      label: "In Plant",
+      value: inPlantCount,
+      secondaryColor: "#3B82F6",
+      icon: <FactoryIcon className="w-[clamp(22px,6.5vw,32px)] h-[clamp(22px,6.5vw,32px)] md:w-[26px] md:h-[26px]" />,
+      accent: "#3B82F6",
+      valueClass: "text-[#3B82F6]",
     },
     {
-      key: "critical",
-      status: "critical",
-      label: "Critical",
-      value: statusCounts.critical,
-      // secondary: roundPct(statusCounts.critical),
-      secondaryColor: "#EF4444",
-      icon: <CriticalIcon className="w-[clamp(22px,6.5vw,32px)] h-[clamp(22px,6.5vw,32px)] md:w-[26px] md:h-[26px]" />,
-      accent: "#EF4444",
-      valueClass: "text-[#EF4444]",
+      key: "offline",
+      status: null,
+      label: "Offline",
+      value: offlineCount,
+      icon: <WifiOff className="w-[clamp(22px,6.5vw,32px)] h-[clamp(22px,6.5vw,32px)] md:w-[26px] md:h-[26px]" />,
+      accent: "#94A3B8",
+      valueClass: "text-[#CBD5E1]",
     },
   ];
+
+  const emptyStateMessage =
+    selectedVIN || locatorSearch
+      ? "No vehicles match your search."
+      : activeCard === "critical"
+        ? "No critical vehicles found."
+        : statusFilter === "riding"
+          ? "No riding vehicles found."
+          : statusFilter === "offline"
+            ? "No offline vehicles found."
+            : activeCard === "onroad"
+          ? "No on-road vehicles found."
+          : activeCard === "inplant"
+            ? "No in-plant vehicles found."
+            : "No vehicles match.";
 
   return (
     <div className="w-full max-w-[1650px] mx-auto px-[clamp(4px,1.5vw,10px)] lg:px-[20px] bg-transparent h-[calc(100vh-8.25rem)] sm:h-[calc(100vh-6.75rem)] flex flex-col overflow-hidden text-white">
   
-      <div className=" mt-[clamp(8px,3vw,14px)] lg:mt-0 grid grid-cols-2 md:grid-cols-3 lg:grid-cols-5 gap-[clamp(3px,1.5vw,9px)] md:gap-2 lg:gap-3.5 shrink-0">
+      <div className=" mt-[clamp(4px,1vw,8px)] lg:mt-0.5 grid grid-cols-2 md:grid-cols-3 lg:grid-cols-5 gap-[clamp(3px,1.5vw,9px)] md:gap-2 lg:gap-3.5 shrink-0">
         {summaryCards.map((card) => {
-          const isActive = card.status !== null && statusFilter === card.status;
+          const isActive = isCardActive(card);
           return (
-            <div
+            <button
               key={card.key}
-              className={card.key === "critical" ? "col-span-2 md:col-span-1" : ""}
-              onClick={
-                card.status
-                  ? () =>
-                      setStatusFilter(
-                        statusFilter === card.status ? "all" : card.status
-                      )
-                  : undefined
-              }
-              className={`${card.key === "critical" ? "col-span-2 md:col-span-1" : ""} bg-[#0D0D0D] rounded-[14px] min-w-0 overflow-hidden h-[clamp(14px,16vw,48px)] md:h-[118px] lg:h-[130px] p-[clamp(8px,2.2vw,10px)] md:p-1 lg:p-[18px] flex items-center ${
-              card.status ? "cursor-pointer transition-colors" : ""
-            }`}
+              type="button"
+              aria-pressed={isActive}
+              title={`Show ${card.label.toLowerCase()}`}
+              onClick={() => selectSummaryCard(card)}
+              className={`${
+                card.key === "critical" ? "col-span-2 md:col-span-1" : ""
+              } group relative appearance-none rounded-[14px] min-w-0 overflow-hidden h-[clamp(80px,10vw,100px)] md:h-[108px] lg:h-[115px] p-[8px] md:p-2 lg:p-3.5 flex items-center text-left cursor-pointer transition-all duration-200 ease-out hover:z-10 hover:-translate-y-0.5 ${
+                card.key === "offline"
+                  ? "hover:shadow-[0_0_20px_rgba(148,163,184,0.16)]"
+                  : "hover:shadow-[0_0_18px_rgba(255,149,0,0.12)]"
+              } focus:outline-none focus-visible:ring-2 focus-visible:ring-[#FF9500] focus-visible:ring-offset-2 focus-visible:ring-offset-[#0B0B0B] ${
+                isActive ? "bg-[#17110a]" : "bg-[#0D0D0D]"
+              }`}
               style={{
-                border: `1px solid ${hexToRgba(card.accent, 0.35)}`,
+                border: `1px solid ${
+                  isActive
+                    ? "#FF9500"
+                    : hexToRgba(
+                        card.key === "offline" ? "#FF9500" : card.accent,
+                        0.35
+                      )
+                }`,
                 boxShadow: isActive
-                  ? `0 0 0 1px ${hexToRgba(card.accent, 0.15)}, 0 0 22px ${hexToRgba(
-                      card.accent,
-                      0.08
-                    )}`
-                  : "none",
+                  ? card.key === "offline"
+                    ? `0 0 0 1px rgba(148,163,184,0.25), 0 0 22px rgba(148,163,184,0.16)`
+                    : `0 0 0 1px rgba(255,149,0,0.30), 0 0 22px rgba(255,149,0,0.18)`
+                  : undefined,
               }}>
               <div
                 className="w-[clamp(30px,4vw,30px)] h-[clamp(30px,4vw,30px)] md:w-12 md:h-12 lg:w-14 lg:h-14 rounded-[12px] flex items-center justify-center shrink-0"
@@ -1149,7 +1423,7 @@ const Nxdetails = ({ onVehicleSelect }) => {
                   {card.secondary}
                 </div>
               </div>
-            </div>
+            </button>
           );
         })}
       </div>
@@ -1288,9 +1562,23 @@ const Nxdetails = ({ onVehicleSelect }) => {
               <button
                 key={opt.key}
                 type="button"
-                onClick={() =>
-                  setStatusFilter(statusFilter === opt.key ? "all" : opt.key)
-                }
+                onClick={() => {
+                  const next = statusFilter === opt.key ? "all" : opt.key;
+                  // Keep the summary cards in sync: selecting Critical or
+                  // Riding clears any On Road / In Plant plate filter.
+                  if (
+                    (next === "critical" || next === "riding") &&
+                    (sortOption === "onroad" || sortOption === "inplant")
+                  ) {
+                    setSortOption("");
+                  }
+                  setStatusFilter(next);
+                  if (next === "critical") setActiveCard("critical");
+                  else if (next === "riding") setActiveCard(null);
+                  else if (sortOption === "onroad") setActiveCard("onroad");
+                  else if (sortOption === "inplant") setActiveCard("inplant");
+                  else setActiveCard(next === "all" ? "total" : null);
+                }}
                 className={`flex items-center gap-1.5 h-[clamp(32px,8vw,38px)] md:h-10 lg:h-11 px-[clamp(5px,1.5vw,7px)] md:px-3.5 rounded-[9px] border text-[clamp(11px,3vw,12px)] md:text-[14px] font-medium transition-colors ${
                   active
                     ? "border-[#FF9500] bg-[rgba(255,149,0,0.10)] text-[#FF9500]"
@@ -1319,7 +1607,18 @@ const Nxdetails = ({ onVehicleSelect }) => {
     <div className="relative w-full lg:w-auto">
     <select
       value={sortOption}
-      onChange={(e) => setSortOption(e.target.value)}
+      onChange={(e) => {
+        const next = e.target.value;
+        setSortOption(next);
+        // Reflect the plate filter on the summary cards; a pure sort leaves the
+        // active category derived from the current status filter.
+        if (next === "onroad") setActiveCard("onroad");
+        else if (next === "inplant") setActiveCard("inplant");
+        else if (statusFilter === "critical") setActiveCard("critical");
+        else if (statusFilter === "offline") setActiveCard("offline");
+        else if (statusFilter === "all") setActiveCard("total");
+        else setActiveCard(null);
+      }}
       className="appearance-none w-[125px] sm:w-[145px] md:w-[180px] lg:w-[240px] h-[38px] md:h-11 lg:h-[46px] bg-[#0E0E0E] border border-[#252525] text-white text-[11px] sm:text-[12px] md:text-[13px] font-Kanit rounded-[9px] px-2.5 pr-7 outline-none cursor-pointer hover:border-[#3A3A3A] focus:border-[#FF9500] transition-colors"
     >
       <option value="">Sort: Status (default)</option>
@@ -1329,6 +1628,8 @@ const Nxdetails = ({ onVehicleSelect }) => {
       <option value="voltage-high">Battery Voltage: High --> Low</option>
       <option value="odometer-low">Odometer: Low --> High</option>
       <option value="odometer-high">Odometer: High --> Low</option>
+      <option value="onroad">On Road (Plate assigned)</option>
+      <option value="inplant">In Plant (No plate)</option>
     </select>
     <svg className="pointer-events-none absolute right-3 top-[60%] -translate-y-1/2 w-[clamp(14px,4vw,18px)] h-[clamp(14px,4vw,18px)] md:w-3.5 md:h-3.5 text-gray-400"
       fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
@@ -1343,13 +1644,13 @@ const Nxdetails = ({ onVehicleSelect }) => {
           className={`hidden lg:grid ${VEHICLE_GRID_COLUMNS} px-4 py-3 shrink-0 lg:divide-x lg:divide-[#252525] lg:overflow-hidden lg:[scrollbar-gutter:stable]`}>
         
         <div className="lg:pr-3.5 text-[14px] font-normal text-[#929292]">
-          Vehicle and owener
+          Owner and VIN
         </div>
         <div className="lg:px-3.5 text-[14px] font-normal text-[#929292]">
           Battery and voltage
         </div>
         <div className="lg:px-3.5 text-[14px] font-normal text-[#929292]">
-          Today(km) and last day(km)
+          Today(km) and Yesterday (km)
         </div>
         <div className="lg:px-3.5 text-[14px] font-normal text-[#929292]">
           Odometer and Regen
@@ -1362,19 +1663,23 @@ const Nxdetails = ({ onVehicleSelect }) => {
         </div>
       </div>
 
-      <div className="flex-1 min-h-0 overflow-y-auto px-1 pl-0 lg:px-0 lg:[scrollbar-gutter:stable]">
+      <div
+        ref={listAnimRef}
+        aria-live="polite"
+        className="flex-1 min-h-0 overflow-y-auto px-1 pl-0 lg:px-0 lg:[scrollbar-gutter:stable]">
         {loading ? (
           <div className="bg-[#0D0D0D] border border-[#252525] rounded-xl py-12 text-center text-gray-500 text-sm">
             Loading...
           </div>
         ) : displayedVehicles.length === 0 ? (
           <div className="bg-[#0D0D0D] border border-[#252525] rounded-xl py-12 text-center text-gray-500 text-sm">
-            No vehicles match.
+            {emptyStateMessage}
           </div>
         ) : (
           <div className="grid grid-cols-1 gap-2.5 lg:gap-0">
             {displayedVehicles.map((vehicle) => {
               const view = buildVehicleView(vehicle);
+              const speedValue = getSpeedValue(vehicle.speed_kmph);
               const modelLabel =
                 vehicle.model &&
                 !/^UNKNOWN/i.test(String(vehicle.model).trim())
@@ -1414,11 +1719,15 @@ const Nxdetails = ({ onVehicleSelect }) => {
                   >
                     {/* VEHICLE */}
                     <div
-                      className="col-span-3 md:col-span-1 flex items-center gap-3 cursor-pointer min-w-0 lg:pr-3.5"
+                      className="relative col-span-3 md:col-span-1 flex items-center gap-3 cursor-pointer min-w-0 lg:pr-3.5"
                       onClick={() =>
-                        onVehicleSelect && onVehicleSelect(vehicle.vinnumber)
+                        onVehicleSelect && onVehicleSelect(vehicle.vinnumber, vehicle.ownername)
                       }
                     >
+                      {renderSpeedBadge(
+                        speedValue,
+                        "absolute right-3 top-3 text-[10px] lg:text-[11px]"
+                      )}
                       <span
                         className="w-2.5 h-2.5 rounded-full shrink-0"
                         style={{
@@ -1435,7 +1744,7 @@ const Nxdetails = ({ onVehicleSelect }) => {
                       >
                         <Bike className="w-[clamp(24px,7vw,32px)] h-[clamp(24px,7vw,32px)] md:w-6 md:h-6" />
                       </div>
-                      <div className="min-w-0">
+                      <div className={`min-w-0 ${speedValue !== null ? "pr-12" : ""}`}>
                         <div className="font-Kanit text-[clamp(17px,4.6vw,21px)] md:text-[17px] text-white  leading-tight truncate">
                           {vehicle.ownername || "Unknown owner"}
                         </div>
@@ -1446,7 +1755,7 @@ const Nxdetails = ({ onVehicleSelect }) => {
                             aria-label="Copy VIN"
                             onClick={(e) => {
                               e.stopPropagation();
-                              if (navigator.clipboard)
+                              if (navigator.claipboard)
                                 navigator.clipboard.writeText(
                                   String(vehicle.vinnumber)
                                 );
@@ -1561,9 +1870,13 @@ const Nxdetails = ({ onVehicleSelect }) => {
                     {/* Row 1: Vehicle */}
                     <div className="flex justify-between items-start pb-1 border-b border-[#252525] gap-1">
                       <div 
-                        className="flex items-center gap-3 cursor-pointer min-w-0"
-                        onClick={() => onVehicleSelect && onVehicleSelect(vehicle.vinnumber)}
+                        className="relative flex items-center gap-3 cursor-pointer min-w-0"
+                        onClick={() => onVehicleSelect && onVehicleSelect(vehicle.vinnumber, vehicle.ownername)}
                       >
+                        {renderSpeedBadge(
+                          speedValue,
+                          "absolute right-3 top-3 text-[10px]"
+                        )}
                         {/* <span
                           className="w-2.5 h-2.5 rounded-full shrink-0 mt-1"
                           style={{
@@ -1580,7 +1893,7 @@ const Nxdetails = ({ onVehicleSelect }) => {
                         >
                           <Bike className="w-[clamp(12px,4vw,22px)] h-[clamp(12px,4vw,22px)]" />
                         </div>
-                        <div className="min-w-0">
+                        <div className={`min-w-0 ${speedValue !== null ? "pr-14" : ""}`}>
                           <div className="font-Kanit text-[clamp(11px,4.6vw,14px)] text-white leading-tight truncate">
                             {vehicle.ownername || "Unknown owner"}
                           </div>
